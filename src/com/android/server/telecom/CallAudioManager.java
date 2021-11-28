@@ -16,9 +16,13 @@
 
 package com.android.server.telecom;
 
+import android.content.Context;
 import android.annotation.NonNull;
 import android.media.IAudioService;
+import android.media.AudioManager;
 import android.media.ToneGenerator;
+import android.provider.Settings;
+import android.provider.Settings.SettingNotFoundException;
 import android.telecom.CallAudioState;
 import android.telecom.Log;
 import android.telecom.VideoProfile;
@@ -62,6 +66,9 @@ public class CallAudioManager extends CallsManagerListenerBase {
     private boolean mIsTonePlaying = false;
     private boolean mIsDisconnectedTonePlaying = false;
     private InCallTonePlayer mHoldTonePlayer;
+    private boolean mIsInCrsMode = false;
+    private int mOriginalCallType = Call.CALL_TYPE_UNKNOWN;
+    private boolean mIsSilenced = false;
 
     public CallAudioManager(CallAudioRouteStateMachine callAudioRouteStateMachine,
             CallsManager callsManager,
@@ -122,6 +129,21 @@ public class CallAudioManager extends CallsManagerListenerBase {
             playToneForDisconnectedCall(call);
         }
 
+        if (newState == CallState.ACTIVE && oldState == CallState.DIALING) {
+            playToneAfterCallConnected(call);
+        }
+        //reset CRS mode once call state changed.
+        if (mIsInCrsMode && (newState != CallState.RINGING)) {
+            mIsInCrsMode = false;
+            if ((mOriginalCallType == VideoProfile.STATE_AUDIO_ONLY)
+                    && !mCallsManager.isWiredHandsetInOrBtAvailble()) {
+                setAudioRoute(CallAudioState.ROUTE_EARPIECE, null);
+            }
+            mOriginalCallType = Call.CALL_TYPE_UNKNOWN;
+            if (mIsSilenced && mRingingCalls.size() == 0) {
+                mIsSilenced = false;
+            }
+        }
         onCallLeavingState(call, oldState);
         onCallEnteringState(call, newState);
     }
@@ -448,10 +470,17 @@ public class CallAudioManager extends CallsManagerListenerBase {
 
     void silenceRingers() {
         synchronized (mCallsManager.getLock()) {
+            if (mRingingCalls.size() >= 1) {
+                mIsSilenced = true;
+            }
             for (Call call : mRingingCalls) {
                 call.silence();
             }
 
+            if(mIsInCrsMode) {
+                Log.i(this, "Fire silence CRS.");
+                onCallSilenceCrs();
+            }
             mRinger.stopRinging();
             mRinger.stopCallWaiting();
         }
@@ -464,6 +493,11 @@ public class CallAudioManager extends CallsManagerListenerBase {
     @VisibleForTesting
     public boolean startRinging() {
         synchronized (mCallsManager.getLock()) {
+            if (mIsInCrsMode) {
+                Log.i(this, "Start to play CRS.");
+                return mRinger.startPlayCrs(mForegroundCall,
+                        mCallAudioRouteStateMachine.isHfpDeviceAvailable());
+            }
             return mRinger.startRinging(mForegroundCall,
                     mCallAudioRouteStateMachine.isHfpDeviceAvailable());
         }
@@ -604,6 +638,13 @@ public class CallAudioManager extends CallsManagerListenerBase {
                 break;
             case CallState.RINGING:
             case CallState.SIMULATED_RINGING:
+                mIsInCrsMode = call.isCrsCall();
+                mOriginalCallType = call.getOriginalCallType();
+                if(mIsInCrsMode &&
+                        !mCallsManager.isWiredHandsetInOrBtAvailble()) {
+                    Log.i(LOG_TAG, "set Audio Route to SPEAKER");
+                    setAudioRoute(CallAudioState.ROUTE_SPEAKER, null);
+                }
                 onCallEnteringRinging();
                 break;
             case CallState.ON_HOLD:
@@ -659,6 +700,20 @@ public class CallAudioManager extends CallsManagerListenerBase {
         }
     }
 
+    private void onRingingCallChanged() {
+        mCallAudioModeStateMachine.sendMessageWithArgs(
+                CallAudioModeStateMachine.RINGING_CALLS_CHANGED,
+                makeArgsForModeStateMachine());
+    }
+
+    private void onCallSilenceCrs() {
+        if (mRingingCalls.size() == 1) {
+            mCallAudioModeStateMachine.sendMessageWithArgs(
+                    CallAudioModeStateMachine.CRS_CHANGE_SILENCE,
+                    makeArgsForModeStateMachine());
+        }
+    }
+
     private void onCallLeavingHold() {
         if (mHoldingCalls.size() == 0) {
             mCallAudioModeStateMachine.sendMessageWithArgs(
@@ -705,6 +760,20 @@ public class CallAudioManager extends CallsManagerListenerBase {
                     mActiveDialingOrConnectingCalls.iterator().next() : possibleConnectingCall;
         } else if (mRingingCalls.size() > 0) {
             mForegroundCall = mRingingCalls.iterator().next();
+            // If there is more than one incoming call, we stop and start the ringtone
+            // when foreground ringing call changes, e.g. the first incoming call is
+            // rejected or ended by remote.
+            if (mRingingCalls.size() == 1 && mForegroundCall != null && oldForegroundCall != null
+                && mForegroundCall != oldForegroundCall) {
+                Log.v(this, "Foreground call changes, start the new ringtone.");
+                if (oldForegroundCall.isCrsCall() && mIsInCrsMode) {
+                    Log.v(this, "Reset CRS mode");
+                    mIsInCrsMode = false;
+                }
+                if (!mIsSilenced) {
+                   onRingingCallChanged();
+                }
+            }
         } else if (mHoldingCalls.size() > 0) {
             mForegroundCall = mHoldingCalls.iterator().next();
         } else {
@@ -729,7 +798,8 @@ public class CallAudioManager extends CallsManagerListenerBase {
                 .setIsTonePlaying(mIsTonePlaying)
                 .setForegroundCallIsVoip(
                         mForegroundCall != null && mForegroundCall.getIsVoipAudioMode())
-                .setSession(Log.createSubsession()).build();
+                .setSession(Log.createSubsession())
+                .setIsCrsCall(mIsInCrsMode).build();
     }
 
     private HashSet<Call> getBinForCall(Call call) {
@@ -747,6 +817,22 @@ public class CallAudioManager extends CallsManagerListenerBase {
     private void removeCallFromAllBins(Call call) {
         for (int i = 0; i < mCallStateToCalls.size(); i++) {
             mCallStateToCalls.valueAt(i).remove(call);
+        }
+    }
+
+    private void playToneAfterCallConnected(Call call) {
+        final Context context = call.getContext();
+        ToneGenerator toneGenerator = new ToneGenerator(AudioManager.STREAM_MUSIC, 90);
+        try {
+            if (Settings.System.getInt(context.getContentResolver(),
+                        Settings.System.CALL_CONNECTED_TONE_ENABLED) == 1) {
+                if (toneGenerator != null) {
+                    Log.i(LOG_TAG, "playing tone");
+                    toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP, 150);
+                }
+            }
+        } catch (SettingNotFoundException e) {
+            Log.e(this, e, "Settings exception when reading playing tone config");
         }
     }
 

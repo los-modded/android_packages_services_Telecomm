@@ -24,6 +24,11 @@ android_app {
     static_libs: [
         "org.lineageos.lib.phone",
         "org.lineageos.platform.internal",
+    libs: [
+      "ims-ext-common",
+    ],
+    uses_libs: [
+      "ims-ext-common",
     ],
     srcs: [
         ":Telecom-srcs",
@@ -76,6 +81,12 @@ android_test {
         "android.test.mock",
         "android.test.base",
         "android.test.runner",
+        "telephony-common",
+        "telephony-ext",
+        "ims-ext-common",
+    ],
+    uses_libs: [
+        "ims-ext-common",
     ],
 
     jni_libs: [

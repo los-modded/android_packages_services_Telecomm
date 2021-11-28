@@ -86,6 +86,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
+import org.codeaurora.ims.QtiCallConstants;
 /**
  *  Encapsulates all aspects of a given phone call throughout its lifecycle, starting
  *  from the time the call intent was received by Telecom (vs. the time the call was
@@ -106,6 +107,8 @@ public class Call implements CreateConnectionResponse, EventManager.Loggable,
     public static final int SOURCE_CONNECTION_SERVICE = 1;
     /** Identifies extras changes which originated from an incall service. */
     public static final int SOURCE_INCALL_SERVICE = 2;
+    /** UNKNOWN original call type for video CRS. */
+    public static final int CALL_TYPE_UNKNOWN = -1;
 
     private static final int RTT_PIPE_READ_SIDE_INDEX = 0;
     private static final int RTT_PIPE_WRITE_SIDE_INDEX = 1;
@@ -113,6 +116,14 @@ public class Call implements CreateConnectionResponse, EventManager.Loggable,
     private static final int INVALID_RTT_REQUEST_ID = -1;
 
     private static final char NO_DTMF_TONE = '\0';
+
+    /**
+     * Connection event used to notify InCallService of phoneaccount changes.
+     * Dialer uses phone account capability to decide whether to enable
+     * some options like RTT. This event will be used for such cases.
+     */
+    private static final String EVENT_PHONE_ACCOUNT_CHANGED =
+            "org.codeaurora.telecom.event.EVENT_PHONE_ACCOUNT_CHANGED";
 
     /**
      * Listener for events on the call.
@@ -389,6 +400,8 @@ public class Call implements CreateConnectionResponse, EventManager.Loggable,
     private boolean mSpeakerphoneOn;
 
     private boolean mIsDisconnectingChildCall = false;
+
+    private boolean mIsChildCall = false;
 
     /**
      * Tracks the video states which were applicable over the duration of a call.
@@ -1577,9 +1590,23 @@ public class Call implements CreateConnectionResponse, EventManager.Loggable,
                 l.onTargetPhoneAccountChanged(this);
             }
             configureCallAttributes();
+            notifyPhoneAccountChanged();
         }
         checkIfVideoCapable();
         checkIfRttCapable();
+    }
+
+    public void handlePhoneAccountChanged(PhoneAccount phoneAccount) {
+        Log.i(this, "handlePhoneAccountChanged");
+        boolean isVideoCapable = phoneAccount != null &&
+                phoneAccount.hasCapabilities(PhoneAccount.CAPABILITY_VIDEO_CALLING);
+        setVideoCallingSupportedByPhoneAccount(isVideoCapable);
+
+        notifyPhoneAccountChanged();
+    }
+
+    private void notifyPhoneAccountChanged() {
+        onConnectionEvent(EVENT_PHONE_ACCOUNT_CHANGED, null);
     }
 
     public CharSequence getTargetPhoneAccountLabel() {
@@ -2076,6 +2103,11 @@ public class Call implements CreateConnectionResponse, EventManager.Loggable,
     public boolean isDisconnectingChildCall() {
         return mIsDisconnectingChildCall;
     }
+
+    public boolean isChildCall() {
+        return mIsChildCall;
+    }
+
 
     /**
      * Sets whether this call is a child call.
@@ -2724,6 +2756,25 @@ public class Call implements CreateConnectionResponse, EventManager.Loggable,
         return mExtras;
     }
 
+    public boolean isCrsCall() {
+        if (mExtras == null) {
+            return false;
+        }
+        int crsType = mExtras.getInt(QtiCallConstants.EXTRA_CRS_TYPE,
+                QtiCallConstants.CRS_TYPE_INVALID);
+        return (crsType == (QtiCallConstants.CRS_TYPE_VIDEO
+                    | QtiCallConstants.CRS_TYPE_AUDIO))
+            || (crsType == QtiCallConstants.CRS_TYPE_AUDIO);
+    }
+
+    public int getOriginalCallType() {
+        if (mExtras == null) {
+            return CALL_TYPE_UNKNOWN;
+        }
+        return mExtras.getInt(QtiCallConstants.EXTRA_ORIGINAL_CALL_TYPE,
+                CALL_TYPE_UNKNOWN);
+    }
+
     /**
      * Adds extras to the extras bundle associated with this {@link Call}.
      *
@@ -3154,6 +3205,7 @@ public class Call implements CreateConnectionResponse, EventManager.Loggable,
     public void setChildOf(Call parentCall) {
         if (parentCall != null && !parentCall.getChildCalls().contains(this)) {
             parentCall.addChildCall(this);
+            mIsChildCall = true;
         }
     }
 
